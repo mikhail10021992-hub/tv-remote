@@ -1,0 +1,706 @@
+name: Build TV AirRemote APK
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: '8.7'
+
+      - name: Generate Project Files
+        shell: bash
+        run: |
+          mkdir -p app/src/main/java/com/example/tvbtremote
+
+          cat << 'EOF' > settings.gradle.kts
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "TVAirRemote"
+          include(":app")
+          EOF
+
+          cat << 'EOF' > build.gradle.kts
+          plugins {
+              id("com.android.application") version "8.3.0" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.22" apply false
+          }
+          EOF
+
+          cat << 'EOF' > gradle.properties
+          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          kotlin.code.style=official
+          android.nonTransitiveRClass=true
+          EOF
+
+          cat << 'EOF' > app/build.gradle.kts
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.example.tvbtremote"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "com.example.tvbtremote"
+                  minSdk = 28
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+
+              buildTypes {
+                  release {
+                      isMinifyEnabled = false
+                  }
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+              buildFeatures {
+                  compose = true
+              }
+              composeOptions {
+                  kotlinCompilerExtensionVersion = "1.5.10"
+              }
+          }
+
+          dependencies {
+              implementation(platform("androidx.compose:compose-bom:2024.02.00"))
+              implementation("androidx.core:core-ktx:1.12.0")
+              implementation("androidx.activity:activity-compose:1.8.2")
+              implementation("androidx.compose.ui:ui")
+              implementation("androidx.compose.material3:material3")
+              implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
+          }
+          EOF
+
+          cat << 'EOF' > app/src/main/AndroidManifest.xml
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />
+              <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" android:maxSdkVersion="30" />
+              <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+              <uses-permission android:name="android.permission.BLUETOOTH_SCAN" />
+              <uses-permission android:name="android.permission.BLUETOOTH_ADVERTISE" />
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+
+              <uses-feature android:name="android.hardware.sensor.gyroscope" android:required="false" />
+
+              <application
+                  android:allowBackup="true"
+                  android:label="TV AirRemote"
+                  android:supportsRtl="true"
+                  android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:screenOrientation="portrait">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+
+          cat << 'EOF' > app/src/main/java/com/example/tvbtremote/BtHidController.kt
+          package com.example.tvbtremote
+
+          import android.annotation.SuppressLint
+          import android.bluetooth.*
+          import android.content.Context
+          import android.hardware.Sensor
+          import android.hardware.SensorEvent
+          import android.hardware.SensorEventListener
+          import android.hardware.SensorManager
+          import android.net.Uri
+          import android.net.wifi.WifiManager
+          import android.provider.OpenableColumns
+          import kotlinx.coroutines.*
+          import kotlinx.coroutines.flow.MutableStateFlow
+          import kotlinx.coroutines.flow.asStateFlow
+          import java.io.OutputStream
+          import java.net.Inet4Address
+          import java.net.NetworkInterface
+          import java.net.ServerSocket
+          import java.util.concurrent.Executors
+          import kotlin.math.roundToInt
+
+          @SuppressLint("MissingPermission")
+          class BtHidController(private val context: Context) : SensorEventListener {
+
+              private val bluetoothManager = context.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
+              private val adapter: BluetoothAdapter? = bluetoothManager.adapter
+              private val sensorManager = context.getSystemService(Context.SENSOR_SERVICE) as SensorManager
+              private val gyroSensor: Sensor? = sensorManager.getDefaultSensor(Sensor.TYPE_GYROSCOPE)
+
+              private var hidDevice: BluetoothHidDevice? = null
+              private var hostDevice: BluetoothDevice? = null
+
+              private val _connectionState = MutableStateFlow("Отключено (Нажмите 'Выбрать ТВ')")
+              val connectionState = _connectionState.asStateFlow()
+
+              private val _isAirMouseActive = MutableStateFlow(false)
+              val isAirMouseActive = _isAirMouseActive.asStateFlow()
+
+              private val _fileServerUrl = MutableStateFlow<String?>(null)
+              val fileServerUrl = _fileServerUrl.asStateFlow()
+
+              private var serverJob: Job? = null
+              private var serverSocket: ServerSocket? = null
+
+              var gyroSensitivity = 18f
+
+              private val hidDescriptor = byteArrayOf(
+                  // KEYBOARD (Report ID 1)
+                  0x05.toByte(), 0x01.toByte(), 0x09.toByte(), 0x06.toByte(), 0xA1.toByte(), 0x01.toByte(),
+                  0x85.toByte(), 0x01.toByte(), 0x05.toByte(), 0x07.toByte(), 0x19.toByte(), 0xE0.toByte(),
+                  0x29.toByte(), 0xE7.toByte(), 0x15.toByte(), 0x00.toByte(), 0x25.toByte(), 0x01.toByte(),
+                  0x75.toByte(), 0x01.toByte(), 0x95.toByte(), 0x08.toByte(), 0x81.toByte(), 0x02.toByte(),
+                  0x95.toByte(), 0x01.toByte(), 0x75.toByte(), 0x08.toByte(), 0x81.toByte(), 0x01.toByte(),
+                  0x95.toByte(), 0x06.toByte(), 0x75.toByte(), 0x08.toByte(), 0x15.toByte(), 0x00.toByte(),
+                  0x25.toByte(), 0x65.toByte(), 0x05.toByte(), 0x07.toByte(), 0x19.toByte(), 0x00.toByte(),
+                  0x29.toByte(), 0x65.toByte(), 0x81.toByte(), 0x00.toByte(), 0xC0.toByte(),
+                  // MOUSE (Report ID 2)
+                  0x05.toByte(), 0x01.toByte(), 0x09.toByte(), 0x02.toByte(), 0xA1.toByte(), 0x01.toByte(),
+                  0x85.toByte(), 0x02.toByte(), 0x09.toByte(), 0x01.toByte(), 0xA1.toByte(), 0x00.toByte(),
+                  0x05.toByte(), 0x09.toByte(), 0x19.toByte(), 0x01.toByte(), 0x29.toByte(), 0x03.toByte(),
+                  0x15.toByte(), 0x00.toByte(), 0x25.toByte(), 0x01.toByte(), 0x95.toByte(), 0x03.toByte(),
+                  0x75.toByte(), 0x01.toByte(), 0x81.toByte(), 0x02.toByte(), 0x95.toByte(), 0x01.toByte(),
+                  0x75.toByte(), 0x05.toByte(), 0x81.toByte(), 0x01.toByte(), 0x05.toByte(), 0x01.toByte(),
+                  0x09.toByte(), 0x30.toByte(), 0x09.toByte(), 0x31.toByte(), 0x09.toByte(), 0x38.toByte(),
+                  0x15.toByte(), 0x81.toByte(), 0x25.toByte(), 0x7F.toByte(), 0x75.toByte(), 0x08.toByte(),
+                  0x95.toByte(), 0x03.toByte(), 0x81.toByte(), 0x06.toByte(), 0xC0.toByte(), 0xC0.toByte()
+              )
+
+              fun initHidProfile() {
+                  adapter?.getProfileProxy(context, object : BluetoothProfile.ServiceListener {
+                      override fun onServiceConnected(profile: Int, proxy: BluetoothProfile) {
+                          if (profile == BluetoothProfile.HID_DEVICE) {
+                              hidDevice = proxy as BluetoothHidDevice
+                              registerApp()
+                          }
+                      }
+                      override fun onServiceDisconnected(profile: Int) {
+                          if (profile == BluetoothProfile.HID_DEVICE) {
+                              hidDevice = null
+                              _connectionState.value = "Сервис HID отключен"
+                          }
+                      }
+                  }, BluetoothProfile.HID_DEVICE)
+              }
+
+              private fun registerApp() {
+                  val sdpSettings = BluetoothHidDeviceAppSdpSettings(
+                      "YandexTV AirRemote",
+                      "Combo Keyboard & AirMouse",
+                      "Android",
+                      BluetoothHidDevice.SUBCLASS1_COMBO,
+                      hidDescriptor
+                  )
+                  hidDevice?.registerApp(
+                      sdpSettings, null, null, Executors.newCachedThreadPool(),
+                      object : BluetoothHidDevice.Callback() {
+                          override fun onAppStatusChanged(pluggedDevice: BluetoothDevice?, registered: Boolean) {
+                              _connectionState.value = if (registered) "HID готов. Выберите ТВ" else "Ошибка HID"
+                          }
+                          override fun onConnectionStateChanged(device: BluetoothDevice?, state: Int) {
+                              when (state) {
+                                  BluetoothProfile.STATE_CONNECTED -> {
+                                      hostDevice = device
+                                      _connectionState.value = "Подключено: ${device?.name ?: device?.address}"
+                                  }
+                                  BluetoothProfile.STATE_CONNECTING -> _connectionState.value = "Подключение..."
+                                  BluetoothProfile.STATE_DISCONNECTED -> {
+                                      hostDevice = null
+                                      stopAirMouse()
+                                      _connectionState.value = "Отключено"
+                                  }
+                              }
+                          }
+                      }
+                  )
+              }
+
+              fun getPairedDevices(): List<BluetoothDevice> = adapter?.bondedDevices?.toList() ?: emptyList()
+
+              fun connectToDevice(device: BluetoothDevice) {
+                  hidDevice?.connect(device)
+              }
+
+              fun sendMouseMove(dx: Int, dy: Int, wheel: Int = 0, leftClick: Boolean = false, rightClick: Boolean = false) {
+                  val device = hostDevice ?: return
+                  var buttons = 0
+                  if (leftClick) buttons = buttons or 1
+                  if (rightClick) buttons = buttons or 2
+                  val report = byteArrayOf(
+                      buttons.toByte(),
+                      dx.coerceIn(-127, 127).toByte(),
+                      dy.coerceIn(-127, 127).toByte(),
+                      wheel.coerceIn(-127, 127).toByte()
+                  )
+                  hidDevice?.sendReport(device, 2, report)
+              }
+
+              fun clickMouse(left: Boolean = true) {
+                  sendMouseMove(0, 0, leftClick = left, rightClick = !left)
+                  sendMouseMove(0, 0, leftClick = false, rightClick = false)
+              }
+
+              fun toggleAirMouse() {
+                  if (_isAirMouseActive.value) stopAirMouse() else startAirMouse()
+              }
+
+              private fun startAirMouse() {
+                  gyroSensor?.let {
+                      sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME)
+                      _isAirMouseActive.value = true
+                  }
+              }
+
+              fun stopAirMouse() {
+                  sensorManager.unregisterListener(this)
+                  _isAirMouseActive.value = false
+              }
+
+              override fun onSensorChanged(event: SensorEvent?) {
+                  if (event?.sensor?.type == Sensor.TYPE_GYROSCOPE && _isAirMouseActive.value) {
+                      val dx = (-event.values[2] * gyroSensitivity).roundToInt()
+                      val dy = (-event.values[0] * gyroSensitivity).roundToInt()
+                      if (dx != 0 || dy != 0) sendMouseMove(dx, dy)
+                  }
+              }
+
+              override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
+
+              fun sendKey(keyCode: Byte, modifier: Byte = 0) {
+                  val device = hostDevice ?: return
+                  val downReport = byteArrayOf(modifier, 0, keyCode, 0, 0, 0, 0, 0)
+                  val upReport = byteArrayOf(0, 0, 0, 0, 0, 0, 0, 0)
+                  hidDevice?.sendReport(device, 1, downReport)
+                  hidDevice?.sendReport(device, 1, upReport)
+              }
+
+              suspend fun typeTextString(text: String) = withContext(Dispatchers.IO) {
+                  for (char in text) {
+                      val (keyCode, shift) = charToHid(char)
+                      if (keyCode != 0.toByte()) {
+                          val mod: Byte = if (shift) 0x02 else 0x00
+                          sendKey(keyCode, mod)
+                          delay(25)
+                      }
+                  }
+              }
+
+              // Встроенный Wi-Fi HTTP сервер для передачи любого файла (VPN конфиг, APK) на ТВ
+              fun startFileShareServer(uri: Uri, scope: CoroutineScope) {
+                  stopFileShareServer()
+                  val fileName = getFileName(uri) ?: "config.ovpn"
+                  val ip = getLocalIpAddress() ?: "127.0.0.1"
+                  val port = 8080
+                  _fileServerUrl.value = "http://$ip:$port"
+
+                  serverJob = scope.launch(Dispatchers.IO) {
+                      try {
+                          serverSocket = ServerSocket(port)
+                          while (isActive) {
+                              val client = serverSocket?.accept() ?: break
+                              launch {
+                                  client.use { sock ->
+                                      val bytes = context.contentResolver.openInputStream(uri)?.readBytes() ?: ByteArray(0)
+                                      val out: OutputStream = sock.getOutputStream()
+                                      val headers = "HTTP/1.1 200 OK\r\n" +
+                                              "Content-Type: application/octet-stream\r\n" +
+                                              "Content-Disposition: attachment; filename=\"$fileName\"\r\n" +
+                                              "Content-Length: ${bytes.size}\r\n" +
+                                              "Connection: close\r\n\r\n"
+                                      out.write(headers.toByteArray())
+                                      out.write(bytes)
+                                      out.flush()
+                                  }
+                              }
+                          }
+                      } catch (_: Exception) {}
+                  }
+              }
+
+              fun stopFileShareServer() {
+                  serverJob?.cancel()
+                  try { serverSocket?.close() } catch (_: Exception) {}
+                  _fileServerUrl.value = null
+              }
+
+              private fun getFileName(uri: Uri): String? {
+                  var name: String? = null
+                  context.contentResolver.query(uri, null, null, null, null)?.use { cursor ->
+                      if (cursor.moveToFirst()) {
+                          val idx = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                          if (idx >= 0) name = cursor.getString(idx)
+                      }
+                  }
+                  return name
+              }
+
+              private fun getLocalIpAddress(): String? {
+                  try {
+                      val interfaces = NetworkInterface.getNetworkInterfaces()
+                      for (intf in interfaces) {
+                          for (addr in intf.inetAddresses) {
+                              if (!addr.isLoopbackAddress && addr is Inet4Address) {
+                                  return addr.hostAddress
+                              }
+                          }
+                      }
+                  } catch (_: Exception) {}
+                  return null
+              }
+
+              private fun charToHid(c: Char): Pair<Byte, Boolean> {
+                  return when (c) {
+                      in 'a'..'z' -> Pair((c - 'a' + 4).toByte(), false)
+                      in 'A'..'Z' -> Pair((c - 'A' + 4).toByte(), true)
+                      in '1'..'9' -> Pair((c - '1' + 0x1E).toByte(), false)
+                      '0' -> Pair(0x27, false)
+                      '\n' -> Pair(0x28, false)
+                      ' ' -> Pair(0x2C, false)
+                      '-' -> Pair(0x2D, false)
+                      '_' -> Pair(0x2D, true)
+                      '=' -> Pair(0x2E, false)
+                      '+' -> Pair(0x2E, true)
+                      '[' -> Pair(0x2F, false)
+                      '{' -> Pair(0x2F, true)
+                      ']' -> Pair(0x30, false)
+                      '}' -> Pair(0x30, true)
+                      '\\' -> Pair(0x31, false)
+                      '|' -> Pair(0x31, true)
+                      ';' -> Pair(0x33, false)
+                      ':' -> Pair(0x33, true)
+                      '\'' -> Pair(0x34, false)
+                      '"' -> Pair(0x34, true)
+                      ',' -> Pair(0x36, false)
+                      '<' -> Pair(0x36, true)
+                      '.' -> Pair(0x37, false)
+                      '>' -> Pair(0x37, true)
+                      '/' -> Pair(0x38, false)
+                      '?' -> Pair(0x38, true)
+                      '!' -> Pair(0x1E, true)
+                      '@' -> Pair(0x1F, true)
+                      '#' -> Pair(0x20, true)
+                      '$' -> Pair(0x21, true)
+                      '%' -> Pair(0x22, true)
+                      '^' -> Pair(0x23, true)
+                      '&' -> Pair(0x24, true)
+                      '*' -> Pair(0x25, true)
+                      '(' -> Pair(0x26, true)
+                      ')' -> Pair(0x27, true)
+                      else -> Pair(0, false)
+                  }
+              }
+          }
+          EOF
+
+          cat << 'EOF' > app/src/main/java/com/example/tvbtremote/MainActivity.kt
+          package com.example.tvbtremote
+
+          import android.Manifest
+          import android.annotation.SuppressLint
+          import android.bluetooth.BluetoothDevice
+          import android.content.ClipboardManager
+          import android.content.Context
+          import android.os.Build
+          import android.os.Bundle
+          import androidx.activity.ComponentActivity
+          import androidx.activity.compose.rememberLauncherForActivityResult
+          import androidx.activity.compose.setContent
+          import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.compose.foundation.background
+          import androidx.compose.foundation.gestures.detectDragGestures
+          import androidx.compose.foundation.gestures.detectTapGestures
+          import androidx.compose.foundation.layout.*
+          import androidx.compose.foundation.shape.RoundedCornerShape
+          import androidx.compose.material3.*
+          import androidx.compose.runtime.*
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.input.pointer.pointerInput
+          import androidx.compose.ui.platform.LocalContext
+          import androidx.compose.ui.text.font.FontWeight
+          import androidx.compose.ui.unit.dp
+          import androidx.compose.ui.unit.sp
+          import kotlinx.coroutines.launch
+          import kotlin.math.roundToInt
+
+          class MainActivity : ComponentActivity() {
+              private lateinit var btController: BtHidController
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  btController = BtHidController(this)
+                  setContent {
+                      MaterialTheme(colorScheme = darkColorScheme()) {
+                          Surface(modifier = Modifier.fillMaxSize(), color = Color(0xFF121212)) {
+                              RemoteControlScreen(btController)
+                          }
+                      }
+                  }
+              }
+
+              override fun onPause() {
+                  super.onPause()
+                  btController.stopAirMouse()
+              }
+          }
+
+          @SuppressLint("MissingPermission")
+          @Composable
+          fun RemoteControlScreen(controller: BtHidController) {
+              val context = LocalContext.current
+              val scope = rememberCoroutineScope()
+              val status by controller.connectionState.collectAsState()
+              val isAirMouse by controller.isAirMouseActive.collectAsState()
+              val fileUrl by controller.fileServerUrl.collectAsState()
+
+              var pairedDevices by remember { mutableStateOf<List<BluetoothDevice>>(emptyList()) }
+              var showDeviceDialog by remember { mutableStateOf(false) }
+              var textToSend by remember { mutableStateOf("") }
+
+              val permissionLauncher = rememberLauncherForActivityResult(
+                  ActivityResultContracts.RequestMultiplePermissions()
+              ) {
+                  controller.initHidProfile()
+                  pairedDevices = controller.getPairedDevices()
+              }
+
+              val filePickerLauncher = rememberLauncherForActivityResult(
+                  ActivityResultContracts.GetContent()
+              ) { uri ->
+                  if (uri != null) {
+                      controller.startFileShareServer(uri, scope)
+                  }
+              }
+
+              LaunchedEffect(Unit) {
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                      permissionLauncher.launch(
+                          arrayOf(
+                              Manifest.permission.BLUETOOTH_CONNECT,
+                              Manifest.permission.BLUETOOTH_SCAN,
+                              Manifest.permission.BLUETOOTH_ADVERTISE
+                          )
+                      )
+                  } else {
+                      controller.initHidProfile()
+                      pairedDevices = controller.getPairedDevices()
+                  }
+              }
+
+              Column(
+                  modifier = Modifier.fillMaxSize().padding(14.dp),
+                  horizontalAlignment = Alignment.CenterHorizontally,
+                  verticalArrangement = Arrangement.spacedBy(10.dp)
+              ) {
+                  Row(
+                      modifier = Modifier.fillMaxWidth(),
+                      horizontalArrangement = Arrangement.SpaceBetween,
+                      verticalAlignment = Alignment.CenterVertically
+                  ) {
+                      Text(
+                          text = status,
+                          color = if (status.startsWith("Подключено")) Color(0xFF4CAF50) else Color.LightGray,
+                          fontSize = 13.sp,
+                          modifier = Modifier.weight(1f)
+                      )
+                      Button(onClick = {
+                          pairedDevices = controller.getPairedDevices()
+                          showDeviceDialog = true
+                      }) {
+                          Text("Выбрать ТВ")
+                      }
+                  }
+
+                  OutlinedTextField(
+                      value = textToSend,
+                      onValueChange = { textToSend = it },
+                      label = { Text("Текст или ключ (vless://, пароль...)") },
+                      modifier = Modifier.fillMaxWidth(),
+                      singleLine = true,
+                      trailingIcon = {
+                          TextButton(onClick = {
+                              val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                              val clip = clipboard.primaryClip?.getItemAt(0)?.text?.toString() ?: ""
+                              textToSend = clip
+                          }) {
+                              Text("Вставить")
+                          }
+                      }
+                  )
+
+                  Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                      Button(
+                          onClick = { scope.launch { controller.typeTextString(textToSend) } },
+                          modifier = Modifier.weight(1f),
+                          colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF1E88E5))
+                      ) {
+                          Text("Напечатать на ТВ")
+                      }
+                      OutlinedButton(onClick = { controller.sendKey(0x2A) }) {
+                          Text("⌫")
+                      }
+                  }
+
+                  // Кнопка раздачи файла (VPN конфига) по Wi-Fi
+                  Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                      OutlinedButton(
+                          onClick = { filePickerLauncher.launch("*/*") },
+                          modifier = Modifier.weight(1f)
+                      ) {
+                          Text(if (fileUrl == null) "📂 Отправить файл по Wi-Fi" else "Раздается: $fileUrl")
+                      }
+                      if (fileUrl != null) {
+                          Button(onClick = {
+                              scope.launch {
+                                  controller.typeTextString(fileUrl!!)
+                                  controller.sendKey(0x28)
+                              }
+                          }) {
+                              Text("Ввести URL на ТВ")
+                          }
+                      }
+                  }
+
+                  Button(
+                      onClick = { controller.toggleAirMouse() },
+                      modifier = Modifier.fillMaxWidth().height(48.dp),
+                      colors = ButtonDefaults.buttonColors(
+                          containerColor = if (isAirMouse) Color(0xFFE53935) else Color(0xFF2E7D32)
+                      )
+                  ) {
+                      Text(
+                          if (isAirMouse) "🎯 АЭРОМЫШЬ АКТИВНА (Стоп)" else "🚀 ВКЛЮЧИТЬ АЭРОМЫШЬ (Гироскоп)",
+                          fontWeight = FontWeight.Bold
+                      )
+                  }
+
+                  Box(
+                      modifier = Modifier
+                          .fillMaxWidth()
+                          .weight(1f)
+                          .background(Color(0xFF1E1E1E), RoundedCornerShape(16.dp))
+                          .pointerInput(Unit) {
+                              detectTapGestures(
+                                  onTap = { controller.clickMouse(left = true) },
+                                  onDoubleTap = { controller.sendKey(0x28) }
+                              )
+                          }
+                          .pointerInput(Unit) {
+                              detectDragGestures { change, dragAmount ->
+                                  change.consume()
+                                  controller.sendMouseMove(
+                                      (dragAmount.x * 1.5f).roundToInt(),
+                                      (dragAmount.y * 1.5f).roundToInt()
+                                  )
+                              }
+                          },
+                      contentAlignment = Alignment.Center
+                  ) {
+                      Text("ТАЧПАД (Тап = Клик, Свайп = Курсор)", color = Color.Gray)
+                  }
+
+                  Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                      Button(onClick = { controller.sendKey(0x52) }, modifier = Modifier.width(85.dp)) { Text("▲") }
+                      Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                          Button(onClick = { controller.sendKey(0x50) }, modifier = Modifier.width(85.dp)) { Text("◄") }
+                          Button(onClick = { controller.sendKey(0x28) }, modifier = Modifier.width(85.dp)) { Text("OK") }
+                          Button(onClick = { controller.sendKey(0x4F) }, modifier = Modifier.width(85.dp)) { Text("►") }
+                      }
+                      Button(onClick = { controller.sendKey(0x51) }, modifier = Modifier.width(85.dp)) { Text("▼") }
+
+                      Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
+                          OutlinedButton(onClick = { controller.sendKey(0x29) }) { Text("Назад") }
+                          OutlinedButton(onClick = { controller.clickMouse(left = true) }) { Text("ЛКМ") }
+                          OutlinedButton(onClick = { controller.sendKey(0x4A) }) { Text("Домой") }
+                      }
+                  }
+              }
+
+              if (showDeviceDialog) {
+                  AlertDialog(
+                      onDismissRequest = { showDeviceDialog = false },
+                      title = { Text("Выберите Яндекс ТВ") },
+                      text = {
+                          Column {
+                              if (pairedDevices.isEmpty()) {
+                                  Text("Сначала спарьте телефон и ТВ в настройках Bluetooth!")
+                              }
+                              pairedDevices.forEach { device ->
+                                  TextButton(
+                                      onClick = {
+                                          controller.connectToDevice(device)
+                                          showDeviceDialog = false
+                                      },
+                                      modifier = Modifier.fillMaxWidth()
+                                  ) {
+                                      Text("${device.name ?: "Устройство"} (${device.address})")
+                                  }
+                              }
+                          }
+                      },
+                      confirmButton = {
+                          TextButton(onClick = { showDeviceDialog = false }) { Text("Закрыть") }
+                      }
+                  )
+              }
+          }
+          EOF
+
+      - name: Build Debug APK
+        run: gradle assembleDebug
+
+      - name: Upload APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: TV-AirRemote-APK
+          path: app/build/outputs/apk/debug/app-debug.apk
