@@ -14,7 +14,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Set up JDK 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           java-version: '17'
           distribution: 'temurin'
@@ -25,7 +25,7 @@ jobs:
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v3
         with:
-          gradle-version: '8.7'
+          gradle-version: '8.5'
 
       - name: Generate Project Files
         shell: bash
@@ -53,7 +53,7 @@ jobs:
 
           cat << 'EOF' > build.gradle.kts
           plugins {
-              id("com.android.application") version "8.3.0" apply false
+              id("com.android.application") version "8.2.2" apply false
               id("org.jetbrains.kotlin.android") version "1.9.22" apply false
           }
           EOF
@@ -99,7 +99,7 @@ jobs:
                   compose = true
               }
               composeOptions {
-                  kotlinCompilerExtensionVersion = "1.5.10"
+                  kotlinCompilerExtensionVersion = "1.5.8"
               }
           }
 
@@ -156,7 +156,6 @@ jobs:
           import android.hardware.SensorEventListener
           import android.hardware.SensorManager
           import android.net.Uri
-          import android.net.wifi.WifiManager
           import android.provider.OpenableColumns
           import kotlinx.coroutines.*
           import kotlinx.coroutines.flow.MutableStateFlow
@@ -194,7 +193,6 @@ jobs:
               var gyroSensitivity = 18f
 
               private val hidDescriptor = byteArrayOf(
-                  // KEYBOARD (Report ID 1)
                   0x05.toByte(), 0x01.toByte(), 0x09.toByte(), 0x06.toByte(), 0xA1.toByte(), 0x01.toByte(),
                   0x85.toByte(), 0x01.toByte(), 0x05.toByte(), 0x07.toByte(), 0x19.toByte(), 0xE0.toByte(),
                   0x29.toByte(), 0xE7.toByte(), 0x15.toByte(), 0x00.toByte(), 0x25.toByte(), 0x01.toByte(),
@@ -203,7 +201,6 @@ jobs:
                   0x95.toByte(), 0x06.toByte(), 0x75.toByte(), 0x08.toByte(), 0x15.toByte(), 0x00.toByte(),
                   0x25.toByte(), 0x65.toByte(), 0x05.toByte(), 0x07.toByte(), 0x19.toByte(), 0x00.toByte(),
                   0x29.toByte(), 0x65.toByte(), 0x81.toByte(), 0x00.toByte(), 0xC0.toByte(),
-                  // MOUSE (Report ID 2)
                   0x05.toByte(), 0x01.toByte(), 0x09.toByte(), 0x02.toByte(), 0xA1.toByte(), 0x01.toByte(),
                   0x85.toByte(), 0x02.toByte(), 0x09.toByte(), 0x01.toByte(), 0xA1.toByte(), 0x00.toByte(),
                   0x05.toByte(), 0x09.toByte(), 0x19.toByte(), 0x01.toByte(), 0x29.toByte(), 0x03.toByte(),
@@ -234,11 +231,8 @@ jobs:
 
               private fun registerApp() {
                   val sdpSettings = BluetoothHidDeviceAppSdpSettings(
-                      "YandexTV AirRemote",
-                      "Combo Keyboard & AirMouse",
-                      "Android",
-                      BluetoothHidDevice.SUBCLASS1_COMBO,
-                      hidDescriptor
+                      "YandexTV AirRemote", "Combo Keyboard & AirMouse", "Android",
+                      BluetoothHidDevice.SUBCLASS1_COMBO, hidDescriptor
                   )
                   hidDevice?.registerApp(
                       sdpSettings, null, null, Executors.newCachedThreadPool(),
@@ -254,8 +248,7 @@ jobs:
                                   }
                                   BluetoothProfile.STATE_CONNECTING -> _connectionState.value = "Подключение..."
                                   BluetoothProfile.STATE_DISCONNECTED -> {
-                                      hostDevice = null
-                                      stopAirMouse()
+                                      hostDevice = null; stopAirMouse()
                                       _connectionState.value = "Отключено"
                                   }
                               }
@@ -265,10 +258,7 @@ jobs:
               }
 
               fun getPairedDevices(): List<BluetoothDevice> = adapter?.bondedDevices?.toList() ?: emptyList()
-
-              fun connectToDevice(device: BluetoothDevice) {
-                  hidDevice?.connect(device)
-              }
+              fun connectToDevice(device: BluetoothDevice) { hidDevice?.connect(device) }
 
               fun sendMouseMove(dx: Int, dy: Int, wheel: Int = 0, leftClick: Boolean = false, rightClick: Boolean = false) {
                   val device = hostDevice ?: return
@@ -289,9 +279,7 @@ jobs:
                   sendMouseMove(0, 0, leftClick = false, rightClick = false)
               }
 
-              fun toggleAirMouse() {
-                  if (_isAirMouseActive.value) stopAirMouse() else startAirMouse()
-              }
+              fun toggleAirMouse() { if (_isAirMouseActive.value) stopAirMouse() else startAirMouse() }
 
               private fun startAirMouse() {
                   gyroSensor?.let {
@@ -334,7 +322,6 @@ jobs:
                   }
               }
 
-              // Встроенный Wi-Fi HTTP сервер для передачи любого файла (VPN конфиг, APK) на ТВ
               fun startFileShareServer(uri: Uri, scope: CoroutineScope) {
                   stopFileShareServer()
                   val fileName = getFileName(uri) ?: "config.ovpn"
@@ -388,9 +375,7 @@ jobs:
                       val interfaces = NetworkInterface.getNetworkInterfaces()
                       for (intf in interfaces) {
                           for (addr in intf.inetAddresses) {
-                              if (!addr.isLoopbackAddress && addr is Inet4Address) {
-                                  return addr.hostAddress
-                              }
+                              if (!addr.isLoopbackAddress && addr is Inet4Address) return addr.hostAddress
                           }
                       }
                   } catch (_: Exception) {}
@@ -475,7 +460,6 @@ jobs:
 
           class MainActivity : ComponentActivity() {
               private lateinit var btController: BtHidController
-
               override fun onCreate(savedInstanceState: Bundle?) {
                   super.onCreate(savedInstanceState)
                   btController = BtHidController(this)
@@ -487,7 +471,6 @@ jobs:
                       }
                   }
               }
-
               override fun onPause() {
                   super.onPause()
                   btController.stopAirMouse()
@@ -517,9 +500,7 @@ jobs:
               val filePickerLauncher = rememberLauncherForActivityResult(
                   ActivityResultContracts.GetContent()
               ) { uri ->
-                  if (uri != null) {
-                      controller.startFileShareServer(uri, scope)
-                  }
+                  if (uri != null) controller.startFileShareServer(uri, scope)
               }
 
               LaunchedEffect(Unit) {
@@ -591,13 +572,12 @@ jobs:
                       }
                   }
 
-                  // Кнопка раздачи файла (VPN конфига) по Wi-Fi
                   Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                       OutlinedButton(
                           onClick = { filePickerLauncher.launch("*/*") },
                           modifier = Modifier.weight(1f)
                       ) {
-                          Text(if (fileUrl == null) "📂 Отправить файл по Wi-Fi" else "Раздается: $fileUrl")
+                      Text(if (fileUrl == null) "📂 Отправить файл по Wi-Fi" else "Раздается: $fileUrl")
                       }
                       if (fileUrl != null) {
                           Button(onClick = {
@@ -689,7 +669,7 @@ jobs:
                           }
                       },
                       confirmButton = {
-                          TextButton(onClick = { showDeviceDialog = false }) { Text("Закрыть") }
+                        TextButton(onClick = { showDeviceDialog = false }) { Text("Закрыть") }
                       }
                   )
               }
